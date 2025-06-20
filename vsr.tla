@@ -1,5 +1,7 @@
 ---- MODULE vsr ----
-\*
+\* 
+\* In Progress!
+\* 
 \* TLA+ Specification for Viewstamped Replication (VSR)
 \* Paper: http://pmg.csail.mit.edu/papers/vr-revisited.pdf
 \*
@@ -146,6 +148,16 @@ VARIABLES
 
 messageVars == <<networkMessages, pendingMessages>>
 
+VARIABLES
+    \* Server i has to receive StartViewChange from atleast f servers, including i itself, to initiate a view change.
+    \* So in total, f + 1 servers must send StartViewChange. (Including itself)
+    \* Int -> Int 
+    receivedSvcCnt,
+    \* Int -> Int
+    receivedDvcCnt
+
+viewChangeVars == <<receivedSvcCnt, receivedDvcCnt>>
+
 \* Used for stuttering
 vars == <<serverVars, logVars, messageVars>>
 
@@ -166,10 +178,6 @@ Discard(m) ==
 \* Empties the pending messages bag for server i — models message loss due to crash or restart.
 ClearPendingMessages(i) ==
     pendingMessages' = [pendingMessages EXCEPT ![i] = EmptyBag]
-
-\* Adds message 'm' to server i's pendingMessages.
-SendToPendingMessages(m, i) == 
-    pendingMessages' = [pendingMessages EXCEPT ![i] = WithMessage(m, pendingMessages[i])]
 
 \* Sends all of server i's pending messages to networkMessages.
 SendPendingMessagesToNetworkMessages(i) ==
@@ -195,19 +203,7 @@ IsPrimaryFromViewNumber(i) ==
 
 \* Checks if server i is in PrimaryNormal state.
 IsPrimary(i) == 
-    state[i] = PrimaryNormal    
-
-\* Debugging helpers
-PrintState ==
-    /\ UNCHANGED <<vars>>
-    /\ PrintT("Message Vars: ")
-    /\ PrintT(messageVars)
-    /\ PrintT("Server Vars: ")
-    /\ PrintT(serverVars)
-    /\ PrintT("Log Vars: ")
-    /\ PrintT(logVars)
-    /\ PrintT("Initially, Primary is server 1: ")
-    /\ PrintT(IsPrimaryFromViewNumber(1))
+    state[i] = PrimaryNormal
 
 \* Define the initial system state.
 InitMessageVars ==
@@ -226,12 +222,21 @@ InitLogVars ==
     /\ opNumber = [i \in Servers |-> 0]
     /\ commitNumber = [i \in Servers |-> 0]    
 
+InitViewChangeVars ==
+    /\ receivedSvcCnt = [i \in Servers |-> 0]
+    /\ receivedDvcCnt = [i \in Servers |-> 0]    
+
 Init ==
     /\ InitMessageVars
     /\ InitServerVars
     /\ InitLogVars
+    /\ InitViewChangeVars
 
 \* Message creation
+
+ResetViewChangeVars(i) ==
+    /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = 0]
+    /\ receivedDvcCnt' = [receivedDvcCnt EXCEPT ![i] = 0]
 
 StartViewChangeMessage(iSource, advViewNumber) ==
     [type           |-> StartViewChangeMsg,
@@ -241,25 +246,68 @@ StartViewChangeMessage(iSource, advViewNumber) ==
 
 \* Broadcast message 'm' to all servers except iSource.
 BroadCastMessage(m, iSource) ==
-    {SendToPendingMessages(m, iTarget) : iTarget \in Servers \ {iSource}}
+    pendingMessages' = [i \in Servers |-> 
+        IF i = iSource 
+        THEN pendingMessages[i] 
+        ELSE WithMessage(m, pendingMessages[i])]
 
 \* State transition actions
 
 \* Replica i times out and initiates a view change. 
 \* Note: TLA+ has no real-time notion of timeout; this is simply another action.
 \* See Section 4.2 of the paper.
-TimeOutStartViewChange(i) ==
+OnTimeOutStartViewChange(i) ==
     \* Primary will never trigger StartViewChange. Replicas do this after missed heartbeats or PrepareOk messages.
     /\ ~IsPrimary(i)
     /\ viewNumber' = [viewNumber EXCEPT ![i] = viewNumber[i] + 1]
     /\ state' = [state EXCEPT ![i] = ViewChange]
-    \* View number updates and message sends both happen in the next step (pendingMessages is updated in the next step).
+    \* View number updates and pendingMessage sends both happen in the next step.
     /\ BroadCastMessage(StartViewChangeMessage(i, viewNumber[i] + 1), i)
+    /\ ResetViewChangeVars(i)
     \* Incoming old-view messages for server i in networkMessages will be ignored in the new view; no discard needed.
     \* No need to clear pendingMessages — server is not restarting, only changing view.
     /\ UNCHANGED <<logVars, networkMessages>>
 
+\* Check if given message m matches messageType & iTarget, Returns TRUE if it does.
+ReceiveMessage(iTarget, messageType, m) ==
+    /\ m.type = messageType
+    /\ m.dest = iTarget
+    /\ networkMessages[m] > 0
+
+\* Integer division of 2f + 1 results in f, for Quorum we need f + 1.
+\* If f are accepted failures, we need f + 1 to ensure a majority.
+QuorumSize == (ServerCount \div 2) + 1      
+
+\* If you consider, self Server is also part of the quorum, then remaining servers needed for quorum is QuorumSize - 1.
+QuorumIncludingSelf == QuorumSize - 1
+
+\* Replica i receives a StartViewChange or DoViewChange message from another replica.
+\* If the view number is higher than its own, it initiates a view change by advancing its view number and broadcasting
+\* simillar to OnTimeOutStartViewChange.
+OnViewChangeMessage(i) == 
+    \E m \in networkMessages:
+        /\ \/ ReceiveMessage(i, StartViewChangeMsg, m)
+           \/ ReceiveMessage(i, DoViewChangeMsg, m)
+        /\ m.advViewNumber > viewNumber[i]
+        /\ viewNumber' = [viewNumber EXCEPT ![i] = m.advViewNumber]
+        /\ state' = [state EXCEPT ![i] = ViewChange]
+        \* Broadcast StartViewChange to all other replicas.
+        /\ BroadCastMessage(StartViewChangeMessage(i, m.advViewNumber), i)
+        /\ IF m.type = StartViewChangeMsg
+           THEN 
+             /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = receivedSvcCnt[i] + 1]
+             /\ receivedDvcCnt' = [receivedDvcCnt EXCEPT ![i] = 0]
+           ELSE 
+             /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = 0]
+             /\ receivedDvcCnt' = [receivedDvcCnt EXCEPT ![i] = receivedDvcCnt[i] + 1]
+        /\ Discard(m)
+        /\ UNCHANGED <<logVars, networkMessages>>
+
+
+
 Next ==
-    \/ /\ \E i \in Servers: TimeOutStartViewChange(i)
-       /\ PrintState            
+    \E i \in Servers: 
+       \/ OnTimeOutStartViewChange(i)
+       \/ OnViewChangeMessage(i)
+
 ====

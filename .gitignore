@@ -1,3 +1,6 @@
 .vscode/*
 **/*.out
 states/*
+scratchfile.tla
+scratchfile.cfg
+.DS_Store
