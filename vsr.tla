@@ -3,154 +3,144 @@
 \* TLA+ Specification for Viewstamped Replication (VSR)
 \* Paper: http://pmg.csail.mit.edu/papers/vr-revisited.pdf
 \*
-\* Structure of Spec is inspired from RAFT Spec https://github.com/etcd-io/raft/blob/main/tla/etcdraft.tla
-\* and VSR Spec https://github.com/Vanlightly/vsr-tlaplus/blob/main/vsr-revisited/paper/VSR.tla
+\* The structure of this spec is inspired by the RAFT Spec (https://github.com/etcd-io/raft/blob/main/tla/etcdraft.tla)
+\* and the VSR Spec (https://github.com/Vanlightly/vsr-tlaplus/blob/main/vsr-revisited/paper/VSR.tla).
 \* 
 \* Notes:
-\*   - View Changes
-\*     RAFT Paper mentions (5.4.1) that in VSR leader can be elected even if the leader does not have the latest state. Which might cause delay in 
-\*     cluster to become active, but I think it is not a problem in practice. As we can increment view number and start a new view change if 
-\*     if current view does not have the latest state or times out. Same is mentioned here https://youtu.be/Wii1LX_ltIs?t=2096
+\*   - View Changes:
+\*     The RAFT paper (Section 5.4.1) mentions that in VSR, a leader can be elected even if it does not have the latest state. 
+\*     This may cause delays in the cluster becoming active, but this is generally not a practical problem. 
+\*     We can increment the view number and initiate a new view change if the current view does not have the latest state or times out. 
+\*     (See: https://youtu.be/Wii1LX_ltIs?t=2096)
 \*   - Recovery  
 \*   - Reconfiguration  
-\*   - Client Requests (Not implemented, Not required for Protocol Verification)
+\*   - Client Requests (Not implemented — not required for protocol verification)
 \* 
-\* Draft:
-\*  - Will start with f = 1. so we will have 2f + 1 replicas. Finally we will try for f = 2.
-\*  - Optimizations
-\*  - Tigerbeetles implementation
-\* - Tigerbeetles invariants 
+\* Draft Plan:
+\*  - Start with f = 1, giving 2f + 1 replicas. Later, aim for f = 2.
+\*  - Add optimizations.
+\*  - Explore TigerBeetle's implementation.
+\*  - Capture TigerBeetle's invariants.
 \*
 \* TODO:
 \* 
 
 EXTENDS Naturals, Integers, Bags, FiniteSets, Sequences, SequencesExt, FiniteSetsExt, BagsExt, TLC
 
-\* Inital set of server Ids {1, 2, 3}, Ids are integer values.
-\* TODO: When reconfiguration is introduced we might have to change this.
+\* Initial set of server IDs {1, 2, 3}; IDs are integer values.
+\* TODO: This may need adjustment when reconfiguration is introduced.
 CONSTANTS
-    \* Viewstamped Replication Servers are ordered by their IP addresses (hashing to int), In place of IP addresses we are using integers 
+    \* Viewstamped Replication Servers are logically ordered by their IP addresses (hashed to integers). Here we simply use integers.
     Servers
 
 \* Reserved value
 CONSTANTS 
     Nil    
 
-\* Status of the servers, Can be Normal, ViewChange or Recovering.
-\* Refer to paper Figure 2 for states defined
+\* Possible server states: Normal, ViewChange, or Recovering.
+\* Refer to Figure 2 of the paper for these states.
 CONSTANTS 
-    \* Primmary & Replica are not required as it can be calculated from the view number
-    \* As we do not want to assume primary based on view number, we will keep these states, to check the invariant if View and Primary/Replica are in sync
+    \* Primary & Replica roles can be derived from the view number, 
+    \* but we explicitly define these to ensure the primary/replica designation aligns with the view number for invariants checking.
     PrimaryNormal,
     ReplicaNormal,
-    \* This state is our initial state
+    \* Initial state
     ViewChange,
     Recovering
 
 \* Message Types
-\* Search for〈 in paper for message types
-\* TODO We are not using all message types, ignoring recovery and reconfiguration messages for now
-\* XXX Client Messages: Not used in this spec
+\* Search for the symbol 〈 in the paper to locate message types.
+\* TODO: Currently not all message types are used; recovery and reconfiguration messages are ignored for now.
+\* XXX Client Messages: Not used in this specification.
 CONSTANTS
-    \* Request sent by a Client to Primary, 〈REQUEST op, c, s〉 
+    \* Request from Client to Primary: 〈REQUEST op, c, s〉 
     \*  op: Operation
-    \*   c: Client Id
-    \*   s: request number assigned to the request
+    \*  c: Client ID
+    \*  s: Request number assigned by the client
     RequestMsg,
-    \* Sent by Primary to Replica after appending request to its log 〈PREPARE v, m, n, k〉
+    \* Sent by Primary to Replica after appending a request to its log: 〈PREPARE v, m, n, k〉
     \*  v: View number
-    \*  m: Message from client
-    \*  n: Op number, it is index in the log
-    \*  k: Commit number, it is the index of the last committed entry in the log (Where state machine is at)
+    \*  m: Client message
+    \*  n: Operation number (index in log)
+    \*  k: Commit number (index of last committed log entry)
     PrepareMsg,
-    \* Sent by Replica to Primary after succesfully appending received message to its log, 〈PREPAREOK v, n, i〉
+    \* Sent by Replica to Primary after successfully appending a message: 〈PREPAREOK v, n, i〉
     \*  v: View number
-    \*  n: Op number, it is index in the log
-    \*  i: Id of the Replica
+    \*  n: Operation number (index in log)
+    \*  i: Replica ID
     PrepareOkMsg,
-    \* Primary after waiting for PrepareOk from majority of Replica, updates state machine (up-call) and increments commit number
-    \*  Then sends 〈REPLY v, s, x〉to the client
+    \* After receiving PrepareOk from the majority of replicas, Primary updates the state machine and increments the commit number.
+    \*  Then sends 〈REPLY v, s, x〉 to the client.
     \*  v: View number
-    \*  s: Request number assigned by client
+    \*  s: Request number from client
     \*  x: Result of the up-call
     ReplyMsg,
-    \* If there are client requests, Primary sends 〈COMMIT v, k〉like a heartbeat, periodically to all Replicas
+    \* If client requests exist, Primary periodically sends 〈COMMIT v, k〉 (as a heartbeat) to all Replicas.
     \*  v: View number
-    \*  k: Commit number, in this case commit number is same as operation number, as there are client requests
+    \*  k: Commit number; in this case, commit number equals operation number as there are client requests.
     CommitMsg,
-    \* Normally primary either sends Prepare or Commit messages, if a timeout expires wihtout communication from the primary,
-    \*  or if replica receieves StartViewChangeMsg from another replica, with a view number greater than its own then
-    \* Replica i advances view number and sends a 〈STARTVIEWCHANGE v, i〉to all other replicas
-    \* v: Advanced View number 
-    \* i: Id of the Replica
+    \* Normally, Primary sends Prepare or Commit messages. If a Replica times out without messages from Primary,
+    \*  or receives StartViewChangeMsg with a higher view number from another Replica, it increments its view number
+    \*  and sends 〈STARTVIEWCHANGE v, i〉 to all other replicas.
+    \*  v: New View number
+    \*  i: Replica ID
     StartViewChangeMsg,
-    \* When a replica receives StartViewChangeMsg from majority of replicas for its advanced view number, 
-    \* it sends 〈DOVIEWCHANGE v, l, v’, n, k, i〉to the node that will be the primary in the new view
+    \* After receiving StartViewChangeMsg from a majority, a Replica sends 〈DOVIEWCHANGE v, l, v’, n, k, i〉 to the new primary.
     \*  v: View number
-    \*  l: Replica Log entries
-    \*  v’: Latest View number of the replica in which its status is Normal
-    \*  n: Op number, it is index in the log
-    \*  k: Commit number, it is the index of the last committed entry
-    \*  i: Id of the Replica
+    \*  l: Replica's log
+    \*  v’: Latest normal view for this replica
+    \*  n: Operation number (index in log)
+    \*  k: Commit number
+    \*  i: Replica ID
     DoViewChangeMsg,
-    \* After receiving DoViewChangeMsg from majority of replicas, it sets its view number to that in the messages
-    \* Selects a new log the once contained in the message with the highest view number, if several messages have the same view number,
-    \* it selects the one with the largest operation number
-    \* Updates with latest op number and commit number with largest received and changes status to Normal
-    \* Then informs all replicas about the new view by sending 〈STARTVIEW v, l, n, k〉
+    \* After receiving DoViewChangeMsg from the majority:
+    \*  - Sets view number from message.
+    \*  - Chooses the log from the message with the highest view number; if tied, the highest op number.
+    \*  - Updates op/commit number and changes state to Normal.
+    \*  - Broadcasts 〈STARTVIEW v, l, n, k〉 to all Replicas.
     \*  v: View number
-    \*  l: Log entries
-    \*  n: Op number, it is index in the log
-    \*  k: Commit number, it is the index of the last committed entry
+    \*  l: Log
+    \*  n: Operation number
+    \*  k: Commit number
     StartViewMsg,
-    \*  TODO Later
+    \*  TODO: To be implemented later
     RecoveryMsg,
     RecoveryResponseMsg,
     GetStateMsg,
     NewStateMsg,
-    \* TODO Later
+    \* TODO: To be implemented later
     ReconfigurationMsg,
     StartEpochMsg,
     EpochStartedMsg,
     CheckEpochMsg,
     NewEpochMsg
 
-
 VARIABLES
-    \* Server state Int -> State, Example 1 -> PrimaryNormal, 2 -> ReplicaNormal, 3 -> ViewChange, 4 -> Recovering
+    \* Server state: Int -> State (e.g., 1 -> PrimaryNormal)
     state,
-    \* Server View number Int -> Int, Example 1 -> 0, 2 -> 1, 3 -> 2
+    \* Server View number: Int -> Int (e.g., 1 -> 0)
     viewNumber
 
 serverVars == <<state, viewNumber>>
 
 VARIABLES 
-    \* Server Log Int -> Seq
+    \* Server log: Int -> Sequence
     log,
-    \* Server Int -> Int, Basically length of the log if log was never truncated
+    \* Server Op number: Int -> Int (length of the log if never truncated)
     opNumber,
-    \* Server Int -> Int, Last committed operation number, index till which state machine is updated
+    \* Server Commit number: Int -> Int (last committed operation number)
     commitNumber
 
 logVars == <<log, opNumber, commitNumber>>
 
 VARIABLES
-    \* Bag (TLA+ Bag) of messages sent by servers to network, Independent of the servers.
-    \* Helps to model the unreliable network with duplicates, reordering and loss of messages
-    \* We would have different operators to read messages into server, like
-    \* /\ operator1
-    \* /\ operator2
-    \* /\ operator3. etc.
-    \* Thus messages are read from the networkMessages are read in out of order due to "or" between operators
-    \* Unreliable network is modeled by discarding messages and
-    \* Duplicates are modeled by adding duplicate messages to the networkMessages
+    \* Bag (TLA+ Bag) of messages in the network — independent of servers.
+    \* Models unreliable network with duplication, reordering, and message loss.
     networkMessages,
-    \* Staging area for messages that are not yet sent to network, but will be sent in the next step
-    \* Each server has its own staging area for pending messages
-    \* Not used for receiving messages, messages are read directly from the networkMessages and actions are performed
-    \* In RAFT implementation, pendingMessages are agnostic to the server, so it is a single bag and it retrieves messages of server using operator PendingMessages(i) 
-    \* on demand, but here we are using pendingMessages as a map from server id to bag of messages to keep it simple
-    \* https://github.com/etcd-io/raft/blob/main/tla/etcdraft.tla#L176C1-L176C19
+    \* Staging area for messages not yet sent to the network; per-server.
+    \* Messages are consumed directly from networkMessages — not from pendingMessages.
+    \* Unlike RAFT (which uses a global bag), we maintain pendingMessages as a per-server map for simplicity.
+    \* See: https://github.com/etcd-io/raft/blob/main/tla/etcdraft.tla#L176C1-L176C19
     \* Int -> Bag of messages
     pendingMessages
 
@@ -161,50 +151,49 @@ vars == <<serverVars, logVars, messageVars>>
 
 \* Helpers
 
-\* Retrurns the bag of messages by adding the message m to the bag msgs
-\* Helps us to add messge to networkMessages or pendingMessages
+\* Returns the bag 'msgs' with message 'm' added.
+\* Used to add a message to networkMessages or pendingMessages.
 WithMessage(m, msgs) == msgs (+) SetToBag({m})
 
-\* Returns the bag of messages by removing the message m from the bag msgs
-\* Helps us to remove message from networkMessages or pendingMessages or discard message (unreliable network)
+\* Returns the bag 'msgs' with message 'm' removed.
+\* Used to remove/discard a message from networkMessages or pendingMessages.
 WithoutMessage(m, msgs) == msgs (-) SetToBag({m})
 
-\* Discard message from networkMessages, to model unreliable network
-\* Also helps to remove message from networkMessages after it has been processed
+\* Discards message 'm' from networkMessages — modeling unreliable delivery.
 Discard(m) ==
     networkMessages' = WithoutMessage(m, networkMessages)
 
-\* Returns the empty bag of messages for server i
-\* Helps us to model loss of messages due to server i crash or restart
+\* Empties the pending messages bag for server i — models message loss due to crash or restart.
 ClearPendingMessages(i) ==
     pendingMessages' = [pendingMessages EXCEPT ![i] = EmptyBag]
 
-\* Adds message m to the pending messages of server i
+\* Adds message 'm' to server i's pendingMessages.
 SendToPendingMessages(m, i) == 
     pendingMessages' = [pendingMessages EXCEPT ![i] = WithMessage(m, pendingMessages[i])]
 
-\* Send all pending messages of server i to the networkMessages
+\* Sends all of server i's pending messages to networkMessages.
 SendPendingMessagesToNetworkMessages(i) ==
     /\ networkMessages' = networkMessages (+) pendingMessages[i]
     /\ pendingMessages' = [pendingMessages EXCEPT ![i] = EmptyBag]       
 
-\* Server count or replica count
+\* Total number of servers (replicas).
 ServerCount == Cardinality(Servers)
 
-\* Computes the primary server id based on the view number
-\* View number is 0 based
-\* View number = 0; Server count = 3; Replica id = 1
-\* View number = 1; Server count = 3; Replica id = 2
-\* View number = 2; Server count = 3; Replica id = 3
-\* View number = 3; Server count = 3; Replica id = 1
+\* Computes the Primary server ID based on the view number.
+\* View number is 0-based.
+\* Example:
+\* View number = 0, Server count = 3 => Primary = 1
+\* View number = 1, Server count = 3 => Primary = 2
+\* View number = 2, Server count = 3 => Primary = 3
+\* View number = 3, Server count = 3 => Primary = 1
 GetPrimaryFromViewNumber(v) == 
     (v % ServerCount) + 1
 
-\* Computes the state of server i based on its view number
+\* Returns TRUE if server i is Primary in its current view.
 IsPrimaryFromViewNumber(i) == 
     GetPrimaryFromViewNumber(viewNumber[i]) = i
 
-\* Checks if state of server i is PrimaryNormal
+\* Checks if server i is in PrimaryNormal state.
 IsPrimary(i) == 
     state[i] = PrimaryNormal    
 
@@ -217,17 +206,17 @@ PrintState ==
     /\ PrintT(serverVars)
     /\ PrintT("Log Vars: ")
     /\ PrintT(logVars)
-    /\ PrintT("In intial state Primary is 1: ")
+    /\ PrintT("Initially, Primary is server 1: ")
     /\ PrintT(IsPrimaryFromViewNumber(1))
-    
 
-\* Define initial state of the system
+\* Define the initial system state.
 InitMessageVars ==
     /\ networkMessages = EmptyBag
     /\ pendingMessages = [i \in Servers |-> EmptyBag]
 
-\* Though we know the primary at init, which is 1, we do not assume it in the spec, we start in ViewChange state and expect the primary to be elected
-\* This would make view number to 1 due to view change, when cluster is started.
+\* Though Primary is known to be server 1 at init, we do not assume this; 
+\* all servers start in ViewChange state and elect the Primary.
+\* The view number will increment due to view change upon cluster start.
 InitServerVars ==
     /\ state = [i \in Servers |-> ViewChange]
     /\ viewNumber = [i \in Servers |-> 0]
@@ -242,36 +231,35 @@ Init ==
     /\ InitServerVars
     /\ InitLogVars
 
-\* Messages
+\* Message creation
 
 StartViewChangeMessage(iSource, advViewNumber) ==
     [type           |-> StartViewChangeMsg,
      advViewNumber  |-> advViewNumber,
      source         |-> iSource,
-     dest           |-> Nil] \* Replaced with iTarget, in broadcast, as it is sent to all replicas
+     dest           |-> Nil] \* Replaced with iTarget during broadcast, since message is sent to all replicas.
 
-\* Broadcast to all other servers, except the source server
+\* Broadcast message 'm' to all servers except iSource.
 BroadCastMessage(m, iSource) ==
     {SendToPendingMessages(m, iTarget) : iTarget \in Servers \ {iSource}}
 
-\* Actions performed for state transitions
+\* State transition actions
 
-\* Replica i times out and starts view change, Note that there is no actual timeout in TLA+, This is just another action that can be triggered
-\* which is triggered at equal precedence as other actions.
-\* Section 4.2 of the paper
+\* Replica i times out and initiates a view change. 
+\* Note: TLA+ has no real-time notion of timeout; this is simply another action.
+\* See Section 4.2 of the paper.
 TimeOutStartViewChange(i) ==
-    \* Primary will never trigger StartViewChange, Replicas in response to missing heartbeat or PrepareOk messages
+    \* Primary will never trigger StartViewChange. Replicas do this after missed heartbeats or PrepareOk messages.
     /\ ~IsPrimary(i)
     /\ viewNumber' = [viewNumber EXCEPT ![i] = viewNumber[i] + 1]
     /\ state' = [state EXCEPT ![i] = ViewChange]
-    \* It would look like viewNumber is updated in next step and message is sent in current step, but it is not the case,
-    \* even messages are sent in the next step, as pendingMessages are updated in the next step in SendToPendingMessages
+    \* View number updates and message sends both happen in the next step (pendingMessages is updated in the next step).
     /\ BroadCastMessage(StartViewChangeMessage(i, viewNumber[i] + 1), i)
-    \* At this point, there will be messages to server i in networkMessages, which will be read in the next step, as they would belong older view are ignored
-    \* as they are not relevant for the new view, so there is no need to discard them
-    \* Similarly, we do not need to clear pending messages, as it would be wrong to do so, as we are not restarting the server, we are just changing the view
+    \* Incoming old-view messages for server i in networkMessages will be ignored in the new view; no discard needed.
+    \* No need to clear pendingMessages — server is not restarting, only changing view.
     /\ UNCHANGED <<logVars, networkMessages>>
 
 Next ==
-    PrintState            
+    \/ /\ \E i \in Servers: TimeOutStartViewChange(i)
+       /\ PrintState            
 ====
