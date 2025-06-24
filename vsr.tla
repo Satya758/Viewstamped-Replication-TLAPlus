@@ -153,13 +153,19 @@ VARIABLES
     \* So in total, f + 1 servers must send StartViewChange. (Including itself)
     \* Int -> Int 
     receivedSvcCnt,
+    \* Int -> DoViewChangeMsg
+    \* As per the paper 4.2 & 3rd bullet point, 
+    \*   selects as the new log the one contained in the message with the largest v′ (last normal view number); 
+    \*   if several messages have the same v′ it selects the one among them with the largest n (operation number).
+    \* As these decisions are made based on the DoViewChange messages received, we store the messages here.
+    receivedDvcMessages,
     \* Int -> Int
-    receivedDvcCnt
+    lastNormalViewNumber
 
-viewChangeVars == <<receivedSvcCnt, receivedDvcCnt>>
+viewChangeVars == <<receivedSvcCnt, receivedDvcMessages, lastNormalViewNumber>>
 
 \* Used for stuttering
-vars == <<serverVars, logVars, messageVars>>
+vars == <<serverVars, logVars, messageVars, viewChangeVars>>
 
 \* Helpers
 
@@ -172,6 +178,7 @@ WithMessage(m, msgs) == msgs (+) SetToBag({m})
 WithoutMessage(m, msgs) == msgs (-) SetToBag({m})
 
 \* Discards message 'm' from networkMessages — modeling unreliable delivery.
+\* Or removes a message after processing it.
 Discard(m) ==
     networkMessages' = WithoutMessage(m, networkMessages)
 
@@ -224,7 +231,10 @@ InitLogVars ==
 
 InitViewChangeVars ==
     /\ receivedSvcCnt = [i \in Servers |-> 0]
-    /\ receivedDvcCnt = [i \in Servers |-> 0]    
+    /\ receivedDvcMessages = [i \in Servers |-> {}]
+    \* As per this implementation, as we start with view 0 in ViewChange state, there is no last normal view number.
+    \* This is set to -1, indicating no normal view has been established yet.
+    /\ lastNormalViewNumber = [i \in Servers |-> -1]    
 
 Init ==
     /\ InitMessageVars
@@ -236,13 +246,40 @@ Init ==
 
 ResetViewChangeVars(i) ==
     /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = 0]
-    /\ receivedDvcCnt' = [receivedDvcCnt EXCEPT ![i] = 0]
+    /\ receivedDvcMessages' = [receivedDvcMessages EXCEPT ![i] = {}]
 
 StartViewChangeMessage(iSource, advViewNumber) ==
     [type           |-> StartViewChangeMsg,
      advViewNumber  |-> advViewNumber,
      source         |-> iSource,
-     dest           |-> Nil] \* Replaced with iTarget during broadcast, since message is sent to all replicas.
+     target         |-> Nil] \* Replaced with iTarget during broadcast, since message is sent to all replicas.
+
+DoViewChangeMessage(iSource) ==
+    [type               |-> DoViewChangeMsg,
+     viewNumber         |-> viewNumber[iSource],
+     log                |-> log[iSource],
+     lastNormalView     |-> lastNormalViewNumber[iSource],
+     opNumber           |-> opNumber[iSource],
+     commitNumber       |-> commitNumber[iSource],
+     source             |-> iSource,
+     \*  Only the new primary will receive this message.
+     target             |-> GetPrimaryFromViewNumber(viewNumber[iSource])]
+
+StartViewMessage(viewNumber, log, opNumber, commitNumber, iSource) ==
+    [type           |-> StartViewMsg,
+     viewNumber     |-> viewNumber,
+     log            |-> log,
+     opNumber       |-> opNumber,
+     commitNumber   |-> commitNumber,
+     source         |-> iSource,
+     target         |-> Nil] \* Replaced with iTarget during broadcast, since message is sent to all replicas.
+
+PrepareOkMessage(iSource, opNumber, iTarget) ==
+    [type           |-> PrepareOkMsg,
+     viewNumber     |-> viewNumber[iSource],
+     opNumber       |-> n,
+     source         |-> iSource,
+     target         |-> iTarget]     
 
 \* Broadcast message 'm' to all servers except iSource.
 BroadCastMessage(m, iSource) ==
@@ -257,21 +294,24 @@ BroadCastMessage(m, iSource) ==
 \* Note: TLA+ has no real-time notion of timeout; this is simply another action.
 \* See Section 4.2 of the paper.
 OnTimeOutStartViewChange(i) ==
-    \* Primary will never trigger StartViewChange. Replicas do this after missed heartbeats or PrepareOk messages.
+    \* Primary will never trigger StartViewChange. Replicas do this after missed heartbeats (Commits) or PrepareOk messages.
     /\ ~IsPrimary(i)
     /\ viewNumber' = [viewNumber EXCEPT ![i] = viewNumber[i] + 1]
     /\ state' = [state EXCEPT ![i] = ViewChange]
-    \* View number updates and pendingMessage sends both happen in the next step.
+    \* Note: View number updates and pendingMessage updates both happen in the next step.
     /\ BroadCastMessage(StartViewChangeMessage(i, viewNumber[i] + 1), i)
-    /\ ResetViewChangeVars(i)
+    \* As we are starting a new view, we set receivedSvcCnt to 1, indicating this is the first request for a new view change.
+    \* When counting receivedSvcCnt, we include the current server i for total required replicas f.
+    /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = 1]
+    /\ receivedDvcMessages' = [receivedDvcMessages EXCEPT ![i] = {}]
     \* Incoming old-view messages for server i in networkMessages will be ignored in the new view; no discard needed.
     \* No need to clear pendingMessages — server is not restarting, only changing view.
-    /\ UNCHANGED <<logVars, networkMessages>>
+    /\ UNCHANGED <<logVars, networkMessages, lastNormalViewNumber>>
 
 \* Check if given message m matches messageType & iTarget, Returns TRUE if it does.
 ReceiveMessage(iTarget, messageType, m) ==
-    /\ m.type = messageType
-    /\ m.dest = iTarget
+    /\ m.type             = messageType
+    /\ m.target           = iTarget
     /\ networkMessages[m] > 0
 
 \* Integer division of 2f + 1 results in f, for Quorum we need f + 1.
@@ -281,27 +321,144 @@ QuorumSize == (ServerCount \div 2) + 1
 \* If you consider, self Server is also part of the quorum, then remaining servers needed for quorum is QuorumSize - 1.
 QuorumIncludingSelf == QuorumSize - 1
 
-\* Replica i receives a StartViewChange or DoViewChange message from another replica.
+\* Replica i receives a StartViewChange message from another replica.
 \* If the view number is higher than its own, it initiates a view change by advancing its view number and broadcasting
 \* simillar to OnTimeOutStartViewChange.
-OnViewChangeMessage(i) == 
+OnStartViewChangeMessage(i) == 
     \E m \in networkMessages:
-        /\ \/ ReceiveMessage(i, StartViewChangeMsg, m)
-           \/ ReceiveMessage(i, DoViewChangeMsg, m)
+        /\ ReceiveMessage(i, StartViewChangeMsg, m)
+        \* This replica is seeing a view change message from another replica first time for the new view.
         /\ m.advViewNumber > viewNumber[i]
-        /\ viewNumber' = [viewNumber EXCEPT ![i] = m.advViewNumber]
-        /\ state' = [state EXCEPT ![i] = ViewChange]
+        /\ viewNumber'     = [viewNumber EXCEPT ![i] = m.advViewNumber]
+        /\ state'          = [state EXCEPT ![i] = ViewChange]
         \* Broadcast StartViewChange to all other replicas.
         /\ BroadCastMessage(StartViewChangeMessage(i, m.advViewNumber), i)
-        /\ IF m.type = StartViewChangeMsg
-           THEN 
-             /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = receivedSvcCnt[i] + 1]
-             /\ receivedDvcCnt' = [receivedDvcCnt EXCEPT ![i] = 0]
-           ELSE 
-             /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = 0]
-             /\ receivedDvcCnt' = [receivedDvcCnt EXCEPT ![i] = receivedDvcCnt[i] + 1]
+        \* As this is the first request for new view change, instead of incrementing we are setting receivedSvcCnt to 1.
+        /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = 1]
+        \* It also never seen a DoViewChange message for this view, so reset it.
+        /\ receivedDvcMessages' = [receivedDvcMessages EXCEPT ![i] = {}]
         /\ Discard(m)
-        /\ UNCHANGED <<logVars, networkMessages>>
+        /\ UNCHANGED <<logVars, networkMessages, lastNormalViewNumber>>
+
+OnDoViewChangeMessage(i) ==
+    \E m \in networkMessages:
+        /\ ReceiveMessage(i, DoViewChangeMsg, m)
+        \* Only primary for the new view can receive DoViewChange messages.
+        /\ GetPrimaryFromViewNumber(m.advViewNumber) = i
+        \* This replica is seeing a DoViewChange message for the first time for the new view.
+        /\ m.advViewNumber > viewNumber[i]
+        /\ viewNumber'     = [viewNumber EXCEPT ![i] = m.advViewNumber]
+        /\ state'          = [state EXCEPT ![i] = ViewChange]
+        \* Broadcast StartViewChange to all other replicas.
+        /\ BroadCastMessage(StartViewChangeMessage(i, m.advViewNumber), i)
+        \* Instead of Union, we are setting receivedDvcCnt to {m}. As this is the first request for new view change.
+        /\ receivedDvcMessages' = [receivedDvcMessages EXCEPT ![i] = {m}]
+        \* It also never seen a StartViewChange message for this view, so reset it.
+        /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = 0]
+        /\ Discard(m)
+        \* No change to logVars.
+        /\ UNCHANGED <<logVars, networkMessages, lastNormalViewNumber>>
+
+OnMatchingStartViewChangeMessage(i) ==
+    \E m \in networkMessages:
+        /\ ReceiveMessage(i, StartViewChangeMsg, m)
+        \* This replica has already seen a StartViewChange message for this view.
+        \* No need to broadcast StartViewChange as we would have done already.
+        /\ m.advViewNumber = viewNumber[i]
+        /\ receivedSvcCnt' = [receivedSvcCnt EXCEPT ![i] = receivedSvcCnt[i] + 1]
+        /\ Discard(m)
+        /\ UNCHANGED <<logVars, state, receivedDvcMessages, lastNormalViewNumber, networkMessages>>        
+
+OnMatchingDoViewChangeMessage(i) ==
+    \E m \in networkMessages:
+        /\ ReceiveMessage(i, DoViewChangeMsg, m)
+        \* Only primary for the new view can receive DoViewChange messages.
+        /\ GetPrimaryFromViewNumber(m.advViewNumber) = i
+        \* This replica has already seen a DoViewChange message for this view.
+        \* No need to broadcast StartViewChange as we would have done already.
+        /\ m.advViewNumber = viewNumber[i]
+        /\ receivedDvcMessages' = [receivedDvcMessages EXCEPT ![i] = receivedDvcMessages[i] \union {m}]
+        /\ Discard(m)
+        /\ UNCHANGED <<logVars, state, receivedSvcCnt, lastNormalViewNumber, networkMessages>>        
+
+\* Section 4.2 & 2 bullet point of the VSR paper.
+PublishDoViewChangeMessage(i) ==
+    /\ status[i] = ViewChange
+    \* Received more than f+1 StartViewChange messages, so we can proceed with DoViewChange.
+    /\ receivedSvcCnt[i] >= QuorumSize
+    /\ LET m = DoViewChangeMessage(i)
+       IN 
+            \*  This replica is primary for the new view, no need to send DoViewChange to itself. 
+         \/ /\ IsPrimaryFromViewNumber(i)
+            /\ receivedDvcMessages' = [receivedDvcMessages EXCEPT ![i] = receivedDvcMessages[i] \union {m}]
+            /\ UNCHANGED <<pendingMessages>>
+         \/ /\ ~IsPrimaryFromViewNumber(i)
+            /\ pendingMessages' = [pendingMessages EXCEPT ![i] = WithMessage(m, pendingMessages[i])]
+            /\ UNCHANGED <<receivedDvcMessages>>
+    /\ UNCHANGED <<logVars, networkMessages, serverVars, receivedSvcCnt, lastNormalViewNumber>>
+
+\* When called, there are DoViewChange messages from a majority of replicas. Thus CHOOSE will not fail.
+\* Means receivedDvcMessages[i] will always have equal or more than Quorum messages.
+HighestLogMessage(i) ==
+    LET m == CHOOSE m \in receivedDvcMessages[i]:
+                ~\E m1 \in receivedDvcMessages[i]:
+                    \/ m1.lastNormalView > m.lastNormalView
+                    \/ /\ m1.lastNormalView = m.lastNormalView 
+                       /\ m1.opNumber > m.opNumber
+    IN m
+
+HighestCommitNumber(i) ==
+    LET m == CHOOSE m \in receivedDvcMessages[i]:
+                ~\E m1 \in receivedDvcMessages[i]:
+                    m1.commitNumber > m.commitNumber
+    IN m.commitNumber    
+
+PublishStartViewMessage(i) ==
+    \* Though the paper mentions to set the view number, i think it is already set in previous steps
+    /\ status[i] = ViewChange
+    /\ Cardinality(receivedDvcMessages[i]) >= QuorumSize
+    /\ IsPrimaryFromViewNumber(i)
+    /\ LET m                    == HighestLogMessage(i)
+           highestCommitNumber  == HighestCommitNumber(i)
+       IN
+           /\ state'                = [state EXCEPT ![i] = PrimaryNormal]
+           /\ log'                  = [log EXCEPT ![i] = m.log]
+           /\ opNumber'             = [opNumber EXCEPT ![i] = m.opNumber]
+           /\ commitNumber'         = [commitNumber EXCEPT ![i] = highestCommitNumber]
+           /\ lastNormalViewNumber' = [lastNormalViewNumber EXCEPT ![i] = viewNumber[i]]
+           /\ BroadCastMessage(StartViewMessage(viewNumber[i], m.log, m.opNumber, highestCommitNumber, i), i)
+           \* As leader is elected we can clear the view change variables.   
+           /\ ResetViewChangeVars(i)     
+    /\ UNCHANGED <<networkMessages, viewNumber>>
+
+OnStartViewMessage(i) ==
+    \E m \in networkMessages:
+        /\ ReceiveMessage(i, StartViewMsg, m)
+        \* This node is a backup (replica) for the new view.
+        /\ GetPrimaryFromViewNumber(m.viewNumber) # i
+        \* Update log, opNumber, commitNumber, and state from the message.
+        /\ log'          = [log EXCEPT ![i] = m.log]
+        /\ opNumber'     = [opNumber EXCEPT ![i] = m.opNumber]
+        /\ commitNumber' = [commitNumber EXCEPT ![i] = m.commitNumber]
+        /\ state'        = [state EXCEPT ![i] = ReplicaNormal]
+        /\ lastNormalViewNumber' = [lastNormalViewNumber EXCEPT ![i] = viewNumber[i]]
+        \* Update view number to the new view number. If it had participated in a view change, 
+        \* it would have already been updated.
+        /\ viewNumber'   = [viewNumber EXCEPT ![i] = m.viewNumber]
+        \* As leader is elected we can clear the view change variables.   
+        /\ ResetViewChangeVars(i)
+        /\ IF commitNumber[i] < m.opNumber
+           THEN 
+                LET pkm = PrepareOkMessage(i, m.opNumber, GetPrimaryFromViewNumber(m.viewNumber))
+                IN
+                /\ pendingMessages' = [pendingMessages EXCEPT ![i] = WithMessage(pkm, pendingMessages[i])]
+                /\ Discard(m)
+           ELSE /\ Discard(m)
+                /\ UNCHANGED <<pendingMessages>>
+        \* No change to networkMessages or pendingMessages.
+        /\ UNCHANGED <<>>
+               
+
 
 
 
